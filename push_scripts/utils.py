@@ -24,9 +24,12 @@ def load_env(env_path: str = None) -> dict:
 
 
 def call_lark(cli_path: str, *args) -> dict:
-    """Call lark-cli and return parsed JSON."""
-    cmd = [cli_path] + list(args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    """Call lark-cli and return parsed JSON.
+    cli_path: path to lark-cli directory (e.g. D:\\D_software\\LarkCLI)
+    """
+    node_script = os.path.join(cli_path, "node_modules", "@larksuite", "cli", "scripts", "run.js")
+    cmd = ["node", node_script] + list(args)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cli_path)
     if result.returncode != 0:
         raise RuntimeError(f"lark-cli error: {result.stderr}")
     return json.loads(result.stdout)
@@ -129,26 +132,60 @@ def deepseek_chat(config: dict, system_prompt: str, user_prompt: str) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def send_message(config: dict, message: str):
-    """Send message to user's Feishu via lark-cli bot."""
+def send_feishu(config: dict, message: str):
+    """Send message via lark-cli bot (markdown)."""
     user_id = config.get("FEISHU_USER_ID", "ou_f5f205e1c2c2527d553b30f191892abc")
-    cli = config["LARK_CLI_PATH"]
+    lark_dir = config.get("LARK_CLI_PATH", r"D:\D_software\LarkCLI")
+    node_script = os.path.join(lark_dir, "node_modules", "@larksuite", "cli", "scripts", "run.js")
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8")
+    tmp.write(message)
+    tmp.close()
+
     try:
-        result = subprocess.run(
-            [cli, "im", "+messages-send", "--as", "bot",
-             "--user-id", user_id, "--markdown", message],
-            capture_output=True, text=True, timeout=30
-        )
+        cmd = f'node "{node_script}" im +messages-send --as bot --user-id {user_id} --markdown "$(cat \'{tmp.name}\')"'
+        result = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=30, cwd=lark_dir)
+        out = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        err = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
         if result.returncode == 0:
-            print("Message sent via lark-cli (bot)")
-        else:
-            try:
-                err = json.loads(result.stderr)
-                msg = err.get("error", {}).get("message", result.stderr)
-            except json.JSONDecodeError:
-                msg = result.stderr or result.stdout
-            print(f"[lark-cli send failed] {msg.strip()}")
-            print(f"[message saved to console]\n{message}")
+            print("Message sent via feishu bot"); return True
+        print(f"[feishu send failed] {err.strip() or out.strip()}"); return False
     except Exception as e:
-        print(f"[lark-cli error] {e}")
+        print(f"[feishu error] {e}"); return False
+    finally:
+        os.unlink(tmp.name)
+
+
+def send_wechat(config: dict, message: str):
+    """Send message via cc-connect to WeChat."""
+    data_dir = config.get("CC_DATA_DIR", r"D:\D_software\cc-connect\data")
+    project = config.get("CC_PROJECT", "wechat")
+    message = message.replace("\\n", "\n").strip().replace("*", "")
+    try:
+        cmd = f'cc-connect send -m "{message}" -p {project} --data-dir "{data_dir}"'
+        result = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=30)
+        out = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        err = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+        if result.returncode == 0:
+            print("Message sent via wechat"); return True
+        print(f"[wechat send failed] {err.strip() or out.strip()}"); return False
+    except Exception as e:
+        print(f"[wechat error] {e}"); return False
+
+
+def send_message(config: dict, message: str):
+    """Send message via configured channel(s)."""
+    message = message.replace("\\n", "\n").strip()
+    channels = config.get("PUSH_CHANNEL", "feishu").split(",")
+    ok = False
+    for ch in channels:
+        ch = ch.strip()
+        if ch == "feishu":
+            ok = send_feishu(config, message) or ok
+        elif ch == "wechat":
+            ok = send_wechat(config, message) or ok
+        else:
+            print(f"[unknown channel] {ch}")
+    if not ok:
         print(f"[message saved to console]\n{message}")
