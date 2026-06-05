@@ -36,11 +36,33 @@ def fetch_active_tasks(config: dict) -> list:
     """Fetch all records from the active tasks table."""
     r = call_lark(
         config["LARK_CLI_PATH"],
-        "base", "+record-list",
+        "base", "+record-list", "--format", "json",
         "--base-token", config["FEISHU_BASE_TOKEN"],
         "--table-id", config["FEISHU_ACTIVE_TABLE"]
     )
-    return r.get("data", {}).get("records", [])
+    # JSON format returns data as arrays indexed by fields
+    data = r.get("data", {})
+    fields = data.get("fields", [])
+    rows = data.get("data", [])
+    record_ids = data.get("record_id_list", [])
+
+    result = []
+    for i, row in enumerate(rows):
+        record = {"id": record_ids[i] if i < len(record_ids) else "", "fields": {}}
+        for j, val in enumerate(row):
+            if j < len(fields):
+                field_name = fields[j]
+                # Clean up: select fields return lists, extract first value
+                if isinstance(val, list):
+                    if val and isinstance(val[0], str):
+                        val = val[0]
+                    elif val and isinstance(val[0], dict) and "name" in val[0]:
+                        val = val[0]["name"]
+                    elif not val:
+                        val = ""
+                record["fields"][field_name] = val
+        result.append(record)
+    return result
 
 
 def health_check(config: dict) -> list:
@@ -59,14 +81,24 @@ def health_check(config: dict) -> list:
     except Exception as e:
         failures.append(f"飞书 API 异常: {e}")
 
-    # Check DeepSeek API quota
+    # Check DeepSeek API availability
     try:
         resp = requests.post(
-            "https://api.deepseek.com/v1/models",
-            headers={"Authorization": f"Bearer {config['DEEPSEEK_API_KEY']}"},
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config['DEEPSEEK_API_KEY']}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": config.get("DEEPSEEK_MODEL", "deepseek-chat"),
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1
+            },
             timeout=10
         )
-        if resp.status_code != 200:
+        if resp.status_code == 402:
+            failures.append("DeepSeek API 余额不足")
+        elif resp.status_code != 200:
             failures.append(f"DeepSeek API 异常: HTTP {resp.status_code}")
     except Exception as e:
         failures.append(f"DeepSeek API 连接失败: {e}")
@@ -98,15 +130,25 @@ def deepseek_chat(config: dict, system_prompt: str, user_prompt: str) -> str:
 
 
 def send_message(config: dict, message: str):
-    """Send message via cc-connect."""
-    project = config.get("CC_CONNECT_PROJECT", "")
-    cmd = ["cc-connect", "send", "--stdin"]
-    if project:
-        cmd.extend(["-p", project])
-
-    result = subprocess.run(
-        cmd, input=message, capture_output=True, text=True,
-        timeout=30
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"cc-connect error: {result.stderr}")
+    """Send message to user's Feishu via lark-cli bot."""
+    user_id = config.get("FEISHU_USER_ID", "ou_f5f205e1c2c2527d553b30f191892abc")
+    cli = config["LARK_CLI_PATH"]
+    try:
+        result = subprocess.run(
+            [cli, "im", "+messages-send", "--as", "bot",
+             "--user-id", user_id, "--markdown", message],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print("Message sent via lark-cli (bot)")
+        else:
+            try:
+                err = json.loads(result.stderr)
+                msg = err.get("error", {}).get("message", result.stderr)
+            except json.JSONDecodeError:
+                msg = result.stderr or result.stdout
+            print(f"[lark-cli send failed] {msg.strip()}")
+            print(f"[message saved to console]\n{message}")
+    except Exception as e:
+        print(f"[lark-cli error] {e}")
+        print(f"[message saved to console]\n{message}")

@@ -1,0 +1,322 @@
+---
+name: todo-manager
+description: 当用户需要添加/查看/更新/管理待办任务、代办事项、任务清单、DDL提醒、获取完成建议时使用此技能。适用于用户告知新任务、粘贴任务文本、查询任务列表、更新任务状态、要求任务提醒、需要任务执行建议等场景。
+version: 1.0.0
+allowed-tools: [Read, Write, Edit, Bash, Glob, Grep, CronCreate, CronDelete, CronList]
+---
+
+# AI 代办任务管理 Skill
+
+## 工作目录
+
+所有数据文件位于 `D:\My-Workspace\AI代办\`：
+
+| 文件 | 说明 |
+|------|------|
+| `tasks.json` | 本地工作副本（以飞书 Base 为数据源） |
+| `archive.json` | 已完成/已取消任务归档 |
+| `总表.md` | 本地备份镜像 |
+| `.todo.base.token` | 飞书 Base token（如有） |
+
+## 数据模型
+
+### tasks.json 结构
+
+```json
+{
+  "meta": {
+    "version": "1.0",
+    "last_updated": "ISO8601",
+    "next_id": 1,
+    "stats": { "todo": 0, "in_progress": 0, "review": 0, "blocked": 0, "completed": 0, "cancelled": 0, "total": 0 },
+    "feishu_base_token": "app_xxx"
+  },
+  "tasks": [...],
+  "categories": ["学业", "科研", "社团", "班级工作", "个人项目", "生活", "其他"]
+}
+```
+
+### 任务字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | string | T-xxx 自增 |
+| title | string | 标题 |
+| description | string | 详细描述 |
+| status | string | todo / in_progress / review / blocked / completed / cancelled |
+| priority | string | P0 / P1 / P2 / P3 / P4 |
+| category | string | 一级分类 |
+| subcategory | string | 子分类（自由文本） |
+| source | string | 任务来源 |
+| deadline | string | YYYY-MM-DD |
+| created_at | string | ISO 8601 |
+| updated_at | string | ISO 8601 |
+| started_at | string | 开始时间 |
+| completed_at | string | 完成时间 |
+| estimated_hours | number | 预估小时 |
+| tags | array | 标签 |
+| longterm_label | string | 长期标签（对应标签看板中的标签名） |
+| notes | string | 备注 |
+
+### 分类（可自然语言调整）
+
+一级：学业、科研、社团、班级工作、个人项目、生活、其他
+子分类为自由文本，AI 自动推断。
+
+### 优先级判定
+
+综合截止天数 + 用户语气 + 任务类型三项打分：
+
+**截止天数分：**
+| 剩余天数 | 分值 |
+|---------|------|
+| 今天/已过期 | 3 |
+| 1-2天 | 2 |
+| 3-7天 | 1 |
+| >7天 | 0 |
+
+**用户语气修正：**
+| 用户说 | 加分 |
+|--------|------|
+| "紧急""加急""赶紧" | +2 |
+| "重要""尽快" | +1 |
+| 无特殊语气 | 0 |
+
+**最终等级：**
+| 总分 | 等级 |
+|------|------|
+| 4-5 | P0 🔥 |
+| 2-3 | P1 🔴 |
+| 1 | P2 🟡 |
+| 0 | P3 🟢 |
+| 想法未定 | P4 ⚪ |
+
+### 状态流转
+
+```
+todo → in_progress → review → completed
+  └──→ blocked ←──────┘
+completed/cancelled → archived
+```
+
+## 标签看板系统
+
+### 概述
+
+长期任务以**标签**形式存在，贴在普通任务的「长期标签」字段上。标签本身在独立的「标签看板」表中管理，包含完成状态。
+
+### 飞书 Base 结构
+
+**任务主表**（原有）：
+- 增加「长期标签」字段（单选，选项来自标签看板）
+- 每个普通任务可选择挂载一个长期标签
+- 已有视图：看板·标签（按长期标签分组的看板视图）
+
+**标签看板表**（独立表）：
+- 标签名（文本）
+- 分类（单选：学科学习/技能学习/项目）
+- 类型（单选：学科学习/技能学习/项目）— 控制状态自动衍生策略
+- 状态（单选：未开始/进行中/已完成）— **由 AI 自动衍生，无需手动维护**
+
+### 标签类型
+
+每种标签根据其性质决定「已完成」是否可自动达成：
+
+| 类型 | 包含标签 | 自动完成策略 |
+|------|---------|-------------|
+| 学科学习 | 高等数学、线性代数、大学物理、理论力学、英语 | **永不自动变"已完成"**（学习持续进行） |
+| 技能学习 | ApolloCyber RT学习、51单片机学习 | 全子任务完成 → 已完成 |
+| 项目 | 创新创业训练项目 | 全子任务完成 → 已完成 |
+
+### 状态自动衍生
+
+每次新增或更新任务后，自动运行以下规则刷新所有标签状态。**统计数据时需同时扫描 tasks.json 和 archive.json**（已归档的任务也算作完成），避免因子任务归档后标签状态无法闭合。
+
+```
+对每个标签：
+  统计该标签下所有子任务（通过 longterm_label 匹配），同时查询 tasks.json 和 archive.json
+  
+  如果 该标签类型 = "学科学习"：
+    → 有子任务 → 状态 = "进行中"
+    → 无子任务 → 状态 = "未开始"
+    （永不设为"已完成"）
+  
+  如果 该标签类型 = "技能学习" 或 "项目"：
+    → 无子任务                   → 状态 = "未开始"
+    → 有进行中/待办的子任务       → 状态 = "进行中"
+    → 所有子任务均为已完成        → 状态 = "已完成"
+    → 已完成后又新增子任务        → 状态 = 自动回到"进行中"
+```
+
+### 操作流程
+
+1. **新增标签** → 写入 `tasks.json` 的 `longterm_labels` 数组 + 同步到飞书标签看板表
+2. **为任务打标签** → 设置任务的 `longterm_label` 字段 + 同步到飞书 Base 的「长期标签」字段
+3. **更新标签状态** → **自动执行**（每次新增/更新任务后自动运行状态衍生逻辑，同步飞书标签看板）
+4. **看板查看** → 飞书 Base 中「看板·标签」视图按标签分组展示所有任务
+
+## 操作流程
+
+### 核心原则：先回答，再提醒
+
+用户找我聊天可能是有具体事情要做，不一定是要看任务。所以：
+- **先回答用户当前的问题**，做完用户要求的事
+- **然后在回复末尾**附上任务提醒（如有）
+- 如果用户问的本身就是任务相关，提醒可以自然融合在回答中
+
+### 启动校验（每次对话自动执行）
+
+每次开始处理用户请求前，先确保本地数据与飞书 Base 一致：
+
+1. **从「任务主表」拉取全部活跃任务**（`+record-list`），已归档任务在「任务归档」表，不干扰日常操作
+5. **自动刷新优先级** — 对每个 status=todo/in_progress 的任务，按当前剩余天数重新打分。**已过期任务（deadline < today）不分配优先级，设为空**，避免虚假显示 P0/P1。未过期任务：今天截止→P0，1-2天→P1，3-7天→P2，>7天→P3。只升级不降级
+6. **检查过期任务** — 扫描所有 deadline 已过的任务，提醒用户
+6. **分时段风格化提醒** — 如果末尾带提醒，根据当前时间语气不同，**带感情色彩，内容用数字分点（1. 2. 3.），每点独立成段**：
+   - 🌅 **早上** → 今日总览 + 建议先做什么
+   - 🌤 **中午/下午** → 剩余任务督促
+   - 🌙 **晚上** → 今日总结 + 明日预告
+
+### 新增任务
+
+1. 从飞书 Base 读取现有记录，确定下个可用 ID（最大 T-xxx +1）
+2. **解析用户输入**：理解中英文日期表达（明天、后天、下周一等），**将相对时间换算为实际日期后填入 deadline 字段，描述中不要保留"明天""后天"等相对词汇**，改为具体描述。例如"明天晚上6点洗衣服"→ deadline=实际日期，描述="洗衣服（晚上6点）"
+3. AI 分配分类 + 优先级
+4. 去重检查（标题相似度对比 Base 中已有任务）
+5. 如果用户指明该任务属于某个长期标签（如"大学物理加个子任务"），设置任务的 `longterm_label` 字段
+6. **生成完成建议** → 根据任务内容、类型、截止时间，给出执行建议（见「任务建议规则」），写入 notes 字段
+7. **写入飞书 Base**（`+record-upsert` 创建记录，含备注 + 长期标签字段）
+8. 刷新 总表.md（从 Base 重新生成）
+9. 运行标签状态自动衍生（更新标签看板状态，见「标签看板系统」）
+10. 回复用户（任务信息 + 标签信息 + 建议摘要）
+
+### 更新/完成任务
+
+1. 定位任务（按 ID 或模糊标题匹配）
+2. 修改指定字段（含 longterm_label 变更）+ 更新 updated_at
+3. 状态变更时记录 started_at / completed_at
+4. **已完成任务清除优先级** — 状态变为 completed 时，同时将 priority 设为空
+5. **次日归档** — 如果任务是前一天或更早完成的（completed_at 日期 < today），将该记录从「任务主表」移至「任务归档」表（`+record-upsert` 到归档表 + `+record-delete` 从主表删除）
+6. **写入飞书 Base**（`+record-upsert --record-id`）
+7. 刷新 总表.md（从 Base 重新生成）
+8. 运行标签状态自动衍生
+9. 回复用户
+
+### 查询
+
+1. **优先从飞书 Base 读取**（`+record-list`），以 Base 数据为准
+2. 如果 Base 读取失败，降级读 tasks.json 本地缓存
+3. 按用户条件过滤回复
+
+### 生成 总表.md
+按 进行中 → 待办 → 已完成 的顺序分区，各区内按优先级>截止日期排序。已完成任务排在总表最下方。任务列表应包含「建议」列，简明扼要展示关键执行建议（每点控制在20字内），完整建议存放在 notes 字段中。
+
+### 飞书 Base 同步
+- 新增任务 → `lark-cli base +record-upsert` 创建记录
+- 更新任务 → `lark-cli base +record-upsert --record-id` 更新记录
+- 先 `+field-list` 获取字段ID映射，再按字段类型构造 CellValue
+
+Base token: `NWAibm9QGa9ScBsH0mXcLhKknRe`
+表名: `任务主表`（table-id: `tblwEDprqbXqjIJE`）
+标签看板表: 通过 `+table-list` 获取 table-id
+lark-cli 路径: `D:\D_software\LarkCLI\lark-cli.cmd`
+
+#### 字段映射（tasks.json → 任务主表）
+
+| tasks.json | Base 字段名 | Base fieldId | Base 类型 | CellValue 格式 |
+|-----------|------------|-------------|----------|---------------|
+| id | ID | fld1XuD6RL | text | 字符串 |
+| title | 任务标题 | fld4rnBCCf | text | 字符串 |
+| description | 描述 | fld4FuB2xV | text | 字符串 |
+| longterm_label | 长期标签 | fldRZA5NE0 | select | 选项名称字符串 |
+| status → 中文映射 | 状态 | fldhh1h1le | select | 选项名称字符串 |
+| priority | 优先级 | fldnEKD6LZ | select | 选项名称字符串 |
+| category | 分类 | fldydyoIWn | select | 选项名称字符串 |
+| subcategory | 子分类 | fldRCVlxft | text | 字符串 |
+| source | 来源 | fldlj5OpEu | text | 字符串 |
+| deadline | 截止日期 | fld7tn1Tak | datetime | "yyyy/MM/dd" |
+| started_at | 开始时间 | fld3D9fcj1 | datetime | "yyyy/MM/dd HH:mm" |
+| completed_at | 完成时间 | fldxi3HSEa | datetime | "yyyy/MM/dd HH:mm" |
+| estimated_hours | 预估时长 | fldycJLvTu | number | 数字 |
+| tags | 标签 | fld6YSWFuv | select(multiple) | 字符串数组 |
+| notes | 备注 | fld3tY7WQg | text | 字符串 |
+
+系统字段（创建时间 `fldt5BIkLG`、更新时间 `fld2TGtGDM`）由 Base 自动处理。
+
+#### 状态映射
+
+| tasks.json | Base 值 |
+|-----------|---------|
+| todo | 待办 |
+| in_progress | 进行中 |
+| review | 审核中 |
+| blocked | 阻塞 |
+| completed | 已完成 |
+| cancelled | 已取消 |
+
+#### 操作示例
+
+```bash
+# 先 cd 到当前工作区目录
+cd D:\D_Project\Claude_Code_Project\cc-connect-workspace\feishu
+
+# 新增任务（直接传字段，不包 {fields:...}）
+lark-cli.cmd base +record-upsert --base-token NWAibm9QGa9ScBsH0mXcLhKknRe --table-id tblwEDprqbXqjIJE --json @task.json
+
+# 读取全部记录
+lark-cli.cmd base +record-list --base-token NWAibm9QGa9ScBsH0mXcLhKknRe --table-id tblwEDprqbXqjIJE
+
+# 字段名方式写入（新增任务时也可直接传字段英文名）
+lark-cli.cmd base +record-upsert --base-token NWAibm9QGa9ScBsH0mXcLhKknRe --table-id tblwEDprqbXqjIJE --json '{"任务标题":"test"}'
+```
+
+## 任务建议规则
+
+每次新增任务时，根据任务类型、内容、截止时间自动生成完成建议，写入 `notes` 字段。
+
+### 建议维度
+
+| 维度 | 说明 | 示例 |
+|------|------|------|
+| 执行方法 | 如何完成这个任务的具体步骤 | "按目的→原理→装置→数据→结论顺序写" |
+| 时间分配 | 建议分几段、每段多久 | "分3段：0.5h+1.5h+1h" |
+| 优先事项 | 先做什么再做什么 | "先处理数据再写小结" |
+| 参考借鉴 | 可参考已完成或同类型任务 | "结构可参考T-001" |
+| 前置准备 | 开始前需要做什么 | "先复习实验原理和操作步骤" |
+
+### 生成规则
+
+1. **同类型任务可套用框架** — 如多个实验报告，建议后面的参考前面的结构
+2. **按剩余时间拆解节奏** — 根据截止日期和预估时长，给出分段完成建议
+3. **进行中的任务侧重收尾** — 列出剩余工作项的优先级顺序
+4. **0% 的任务侧重启动** — 给出第一步做什么的具体指引
+5. **新增时主动拆解步骤** — 对于复杂任务（预估>2h），AI 自动拆成2-3个隐含步骤写入 notes，如"①先做A ②再做B ③最后C"。后续更新状态时可直接引用这些步骤来给出收尾建议
+6. **批量新增时一并生成** — 每个任务各自生成独立建议
+7. **更新状态时重新生成** — 从 todo 变为 in_progress 时更新建议
+
+### 写入方式
+
+```
+notes: "建议：①先复习实验原理 ②按框架写报告 ③分3段完成：0.5h+1.5h+1h"
+```
+
+总表 MD 中展示精简版本，完整版在飞书 Base 的「备注」字段查看。
+
+### 时间表达式解析
+
+| 用户说 | AI 解析 |
+|--------|---------|
+| "明天" | 当前日期+1 |
+| "下周一" | 下周一日期 |
+| "月底" | 当月最后一天 |
+| "下个月" | 下月同日 |
+| "EOD" | 今天 |
+| "next Monday" | 下周一 |
+| "by Friday" | 本周五 |
+
+## Cron 定时提醒
+
+默认设置（用户确认后创建）：
+- 早报 08:00: 今日到期 + 已过期任务提醒
+- 晚报 20:00: 明日到期预告
+
+CronCreate prompt: "检查 D:\\My-Workspace\\AI代办\\tasks.json 中所有任务，按 DDL 生成提醒摘要。"

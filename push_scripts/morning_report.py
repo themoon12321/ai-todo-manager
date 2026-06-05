@@ -1,102 +1,140 @@
 """AI 代办系统 - 早安播报推送"""
 
 import sys
+import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import load_env, health_check, fetch_active_tasks, deepseek_chat, send_message
 
 
-def build_morning_data(tasks: list) -> dict:
-    """Analyze tasks and build structured morning report data."""
-    today_deadline = []
+def build_morning_context(tasks: list) -> str:
+    """Build structured morning report data for DeepSeek prompt."""
+    today = datetime.date.today()
+    week_end = today + datetime.timedelta(days=(6 - today.weekday()))  # 本周日
+
+    today_due = []
+    this_week = []
     overdue = []
     no_deadline = []
-    priority_counts = {"P0 🔥": 0, "P1 🔴": 0, "P2 🟡": 0, "P3 🟢": 0, "P4 ⚪": 0}
-    total = 0
+    completed = []
+    in_progress = []
+    todo = []
 
-    import datetime
-    today = datetime.date.today()
+    for t in tasks:
+        f = t.get("fields", {})
+        status = f.get("状态", "")
+        deadline_str = f.get("截止日期", "")
 
-    for task in tasks:
-        fields = task.get("fields", {})
-        status = fields.get("状态", "")
-        deadline_str = fields.get("截止日期", "")
-
-        if status in ("已完成", "已取消"):
+        if status == "已完成":
+            completed.append(t)
             continue
 
-        total += 1
-        priority = fields.get("优先级", "")
-        if priority in priority_counts:
-            priority_counts[priority] += 1
+        task_info = {
+            "title": f.get("标题", ""),
+            "priority": f.get("优先级", ""),
+            "deadline": deadline_str[:10] if deadline_str else None,
+            "hours": f.get("预估时长"),
+            "category": f.get("所属分类", ""),
+        }
 
-        if deadline_str:
+        if status == "进行中":
+            in_progress.append(task_info)
+        elif status == "待办" or not status:
+            todo.append(task_info)
+
+        if task_info["deadline"]:
             try:
-                deadline = datetime.datetime.strptime(deadline_str[:10], "%Y-%m-%d").date()
-                if deadline < today:
-                    overdue.append(task)
-                elif deadline == today:
-                    today_deadline.append(task)
+                d = datetime.datetime.strptime(task_info["deadline"], "%Y-%m-%d").date()
+                if d < today:
+                    overdue.append(task_info)
+                elif d == today:
+                    today_due.append(task_info)
+                elif d <= week_end:
+                    this_week.append(task_info)
             except ValueError:
-                no_deadline.append(task)
+                no_deadline.append(task_info)
         else:
-            no_deadline.append(task)
+            no_deadline.append(task_info)
 
-    return {
-        "total_pending": total,
-        "today_deadline_count": len(today_deadline),
-        "overdue_count": len(overdue),
-        "no_deadline_count": len(no_deadline),
-        "priority_counts": priority_counts,
-        "overdue_tasks": [t.get("fields", {}).get("标题", "") for t in overdue[:5]],
-        "today_tasks": [t.get("fields", {}).get("标题", "") for t in today_deadline[:5]],
-    }
+    return f"""今天是 {today.strftime('%Y年%m月%d日')}（{['周一','周二','周三','周四','周五','周六','周日'][today.weekday()]}）。
+
+=== 任务统计 ===
+总任务：{len(tasks)}
+已完成：{len(completed)}
+进行中：{len(in_progress)}
+待办：{len(todo)}
+今日截止：{len(today_due)}
+本周到期：{len(this_week)}
+已过期：{len(overdue)}
+
+=== 今日截止任务 ===
+{chr(10).join(f'- {t["title"]} | 优先级:{t["priority"]} | 预估:{t["hours"]}h' for t in today_due) if today_due else '今日暂无截止任务'}
+
+=== 本周紧急任务 ===
+{chr(10).join(f'- {t["title"]} | 优先级:{t["priority"]} | 截止:{t["deadline"]} | 预估:{t["hours"]}h' for t in this_week) if this_week else '无'}
+
+=== 过期任务 ===
+{chr(10).join(f'- {t["title"]} | 截止:{t["deadline"]} | 预估:{t["hours"]}h' for t in overdue) if overdue else '无'}
+
+=== 进行中任务 ===
+{chr(10).join(f'- {t["title"]} | 截止:{t["deadline"] or "无"} | 优先级:{t["priority"]}' for t in in_progress) if in_progress else '无'}
+
+=== 已完成今日 ===
+{chr(10).join(f'- {t["title"]}' for t in completed) if completed else '暂无'}
+
+请根据以上数据生成早安播报。"""
 
 
 def main():
     config = load_env()
 
-    # Health check
     failures = health_check(config)
     if failures:
-        alert = "⚠️ AI 代办健康检查失败：\n" + "\n".join(failures)
-        send_message(config, alert)
-        print("Health check failed, alert sent")
-        return
+        print("Health check warnings:")
+        for f in failures:
+            print(f"  - {f}")
+    else:
+        print("Health check passed")
 
-    # Fetch tasks
     tasks = fetch_active_tasks(config)
-    data = build_morning_data(tasks)
+    context = build_morning_context(tasks)
 
-    # Generate morning report via DeepSeek
-    system_prompt = """你是一个温暖贴心的AI助手，负责为用户生成早安播报。
-用口语化的中文，语气根据时间带感情色彩。
-要求：
-- 开头先问候，根据数据调整语气（今天任务多就加油打气，少就轻松愉快）
-- 中间用数字分点列出关键信息
-- 结尾给出今日建议（优先做什么）
-- 整体控制在200字以内
-- 不要冷冰冰的数据堆砌，要有人情味"""
+    system_prompt = """你是一个温暖贴心的AI代办助手，负责生成早安播报。
+生成格式严格如下（用markdown）：
 
-    user_prompt = f"""今天是 {__import__('datetime').date.today().strftime('%Y年%m月%d日')}。
+🌅 早间代办报告 · 日期（周X）
+📋 今日待办提醒
+[今日任务概述]
 
-今日任务概览：
-- 待办任务总数：{data['total_pending']} 个
-- 今日截止：{data['today_deadline_count']} 个
-- 已过期：{data['overdue_count']} 个
-- 无截止日期：{data['no_deadline_count']} 个
+🔥 本周紧急任务（截止本周内）
+[任务列表，每行: - 任务: xxx, 优先级: xxx, 截止日期: xxx, 预估时长: xxx]
 
-优先级分布：
-{chr(10).join(f'  {k}: {v}个' for k, v in data['priority_counts'].items() if v > 0)}
+---
+⚠️ 过期任务提醒（请尽快处理）
+[过期任务列表]
 
-{"今日截止任务：" + '、'.join(data['today_tasks']) if data['today_tasks'] else ""}
-{"已过期任务：" + '、'.join(data['overdue_tasks']) if data['overdue_tasks'] else ""}
+💡 早间小贴士
+- 📌 今日重点：[一句话总结做什么]
+- ⏰ 时间分配：[建议]
+- 🌟 温馨提示：[鼓励的话]
 
-请生成今天的早安播报。"""
+📊 今日任务小结
+- 总任务：X
+- ✅ 已完成：X
+- 🔄 进行中：X
+- ⏳ 待办：X
+- 📈 完成率：X%
+
+☀️ 早安问候
+[有温度的话，简短有力]
+
+语气温暖有活力，不要啰嗦，控制在合理长度。"""
+
+    user_prompt = f"请根据以下数据生成早安播报：\n\n{context}"
 
     report = deepseek_chat(config, system_prompt, user_prompt)
-    send_message(config, f"🌅 早安播报\n\n{report}")
+    send_message(config, report)
     print("Morning report sent successfully")
 
 

@@ -1,110 +1,151 @@
 """AI 代办系统 - 晚安播报推送"""
 
 import sys
-from pathlib import Path
 import datetime
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils import load_env, health_check, fetch_active_tasks, deepseek_chat, send_message
 
 
-def build_evening_data(tasks: list) -> dict:
-    """Analyze tasks and build structured evening report data."""
-    today_completed = []
-    tomorrow_deadline = []
-    overdue = []
-    total_pending = 0
-
+def build_evening_context(tasks: list) -> str:
+    """Build structured evening report data for DeepSeek prompt."""
     today = datetime.date.today()
     tomorrow = today + datetime.timedelta(days=1)
 
-    for task in tasks:
-        fields = task.get("fields", {})
-        status = fields.get("状态", "")
-        deadline_str = fields.get("截止日期", "")
+    completed_today = []
+    todo = []
+    in_progress = []
+    overdue = []
+    tomorrow_due = []
 
-        # Today's completed
-        completed_str = fields.get("完成时间", "")
+    for t in tasks:
+        f = t.get("fields", {})
+        status = f.get("状态", "")
+        deadline_str = f.get("截止日期", "")
+        completed_str = f.get("完成时间", "")
+
+        task_info = {
+            "title": f.get("标题", ""),
+            "priority": f.get("优先级", ""),
+            "deadline": deadline_str[:10] if deadline_str else None,
+            "hours": f.get("预估时长"),
+            "category": f.get("所属分类", ""),
+            "status": status
+        }
+
+        # Check if completed today
         if status == "已完成" and completed_str:
             try:
-                completed_date = datetime.datetime.strptime(completed_str[:10], "%Y-%m-%d").date()
-                if completed_date == today:
-                    today_completed.append(task)
+                cd = datetime.datetime.strptime(completed_str[:10], "%Y-%m-%d").date()
+                if cd == today:
+                    completed_today.append(task_info)
+                    continue
             except ValueError:
                 pass
-        elif status == "已完成":
-            today_completed.append(task)
 
-        if status in ("已完成", "已取消"):
+        if status == "已完成" or status == "已取消":
             continue
 
-        total_pending += 1
+        if status == "进行中":
+            in_progress.append(task_info)
+        else:
+            todo.append(task_info)
 
         if deadline_str:
             try:
-                deadline = datetime.datetime.strptime(deadline_str[:10], "%Y-%m-%d").date()
-                if deadline < today:
-                    overdue.append(task)
-                elif deadline == tomorrow:
-                    tomorrow_deadline.append(task)
+                d = datetime.datetime.strptime(deadline_str[:10], "%Y-%m-%d").date()
+                if d < today:
+                    overdue.append(task_info)
+                elif d == tomorrow:
+                    tomorrow_due.append(task_info)
             except ValueError:
                 pass
 
-    return {
-        "today_completed_count": len(today_completed),
-        "today_completed_tasks": [t.get("fields", {}).get("标题", "") for t in today_completed[:5]],
-        "tomorrow_deadline_count": len(tomorrow_deadline),
-        "tomorrow_tasks": [t.get("fields", {}).get("标题", "") for t in tomorrow_deadline[:5]],
-        "overdue_count": len(overdue),
-        "total_pending": total_pending,
-    }
+    # Stats
+    total = len(tasks)
+    done_count = len(completed_today)
+    pending = total - done_count
+
+    return f"""今天是 {today.strftime('%Y年%m月%d日')}（{['周一','周二','周三','周四','周五','周六','周日'][today.weekday()]}）。
+明天是 {tomorrow.strftime('%Y年%m月%d日')}（{['周一','周二','周三','周四','周五','周六','周日'][tomorrow.weekday()]}）。
+
+=== 任务统计 ===
+总任务：{total}
+今日已完成：{done_count}
+进行中：{len(in_progress)}
+待办：{len(todo)}
+已过期：{len(overdue)}
+明日截止：{len(tomorrow_due)}
+
+=== 今日已完成任务 ===
+{chr(10).join(f'- {t["title"]} | {t["category"]} | 预估:{t["hours"]}h' for t in completed_today) if completed_today else '暂无'}
+
+=== 待办任务列表 ===
+{chr(10).join(f'- {t["title"]} | 优先级:{t["priority"]} | 截止:{t["deadline"] or "无"} | 预估:{t["hours"]}h | {t["category"]}' for t in todo) if todo else '无'}
+
+=== 进行中任务 ===
+{chr(10).join(f'- {t["title"]} | 截止:{t["deadline"] or "无"}' for t in in_progress) if in_progress else '无'}
+
+=== 过期未处理 ===
+{chr(10).join(f'- {t["title"]} | 截止:{t["deadline"]} | 预估:{t["hours"]}h | {t["category"]}' for t in overdue) if overdue else '无'}
+
+=== 明日截止 ===
+{chr(10).join(f'- {t["title"]} | 优先级:{t["priority"]} | 预估:{t["hours"]}h' for t in tomorrow_due) if tomorrow_due else '明日暂无紧急截止任务'}
+
+请根据以上数据生成晚安播报。"""
 
 
 def main():
     config = load_env()
 
-    # Health check
     failures = health_check(config)
     if failures:
-        alert = "⚠️ AI 代办健康检查失败：\n" + "\n".join(failures)
-        send_message(config, alert)
-        print("Health check failed, alert sent")
-        return
+        print("Health check warnings:")
+        for f in failures:
+            print(f"  - {f}")
+    else:
+        print("Health check passed")
 
-    # Fetch tasks
     tasks = fetch_active_tasks(config)
-    data = build_evening_data(tasks)
+    context = build_evening_context(tasks)
 
-    # Generate evening report via DeepSeek
-    system_prompt = """你是一个温暖贴心的AI助手，负责为用户生成晚安播报。
-用口语化的中文，语气温暖、鼓励、带安慰感。
-要求：
-- 开头先问候，对今天完成的任务给予肯定
-- 如果今天完成了很多任务，要表扬用户
-- 如果今天完成得少或有很多过期任务，要安慰鼓励，不要责备
-- 中间用数字分点列出信息
-- 结尾给出明天预告，道晚安
-- 整体控制在200字以内
-- 要有"今天辛苦了"的感觉"""
+    system_prompt = """你是一个温暖贴心的AI代办助手，负责生成晚安播报。
+生成格式严格如下（用markdown）：
 
-    user_prompt = f"""今天是 {today.strftime('%Y年%m月%d日')}。
+🌙 晚间代办报告 · 日期（周X）
 
-今日总结：
-- 今日完成：{data['today_completed_count']} 个
-- 剩余待办：{data['total_pending']} 个
-- 已过期未处理：{data['overdue_count']} 个
+📊 今日任务小结
+- 总任务: X项 | 已完成: X项 | 进行中: X项 | 待办: X项
+- 完成率: X%
 
-明日预告：
-- 明天截止：{data['tomorrow_deadline_count']} 个
+📋 待办 (X项)
+[任务列表，每行: - xxx | 截止X月X日 (状态标签) | Xh | 分类]
 
-{"今日完成：" + '、'.join(data['today_completed_tasks']) if data['today_completed_tasks'] else "今天没有完成任务，没关系明天继续"}
-{"明日截止：" + '、'.join(data['tomorrow_tasks']) if data['tomorrow_tasks'] else "明天没有紧急截止的任务"}
+💡 智能提示
+[1-2条针对性建议]
 
-请生成今晚的晚安播报。"""
+🗓️ 明日行动建议
+[明天重点做什么]
 
-    today = datetime.date.today()
+⏰ 时间分配建议
+[优先级排序]
+
+💌 温馨提示
+[鼓励的话]
+
+✅ 今日已完成 (X项)
+[已完成任务列表]
+
+[晚安问候]
+
+语气温暖有安慰感。今天完成得少不要责备，多鼓励。完成得多就表扬。
+控制在合理长度。"""
+
+    user_prompt = f"请根据以下数据生成晚安播报：\n\n{context}"
+
     report = deepseek_chat(config, system_prompt, user_prompt)
-    send_message(config, f"🌙 晚安播报\n\n{report}")
+    send_message(config, report)
     print("Evening report sent successfully")
 
 

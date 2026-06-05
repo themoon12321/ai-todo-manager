@@ -12,3 +12,9 @@ Thumbs.db
 
 # 本地缓存
 tasks_cache.json
+
+# 本地配置
+.claude/
+
+# 旧文件备份
+SKILL.md.old
