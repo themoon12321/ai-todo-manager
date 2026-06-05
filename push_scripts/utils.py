@@ -133,7 +133,6 @@ def send_feishu(config: dict, message: str):
     node_script = os.path.join(lark_dir, "node_modules", "@larksuite", "cli", "scripts", "run.js")
     message = message.replace("\\n", "\n").strip()
 
-    # Split by blank lines into sections, join section lines with \n
     sections = re.split(r"\n\n+", message)
     content = []
     for i, sec in enumerate(sections):
@@ -144,7 +143,7 @@ def send_feishu(config: dict, message: str):
         if i < len(sections) - 1:
             content.append([{"tag": "hr"}])
 
-    payload = json.dumps({"zh_cn": {"title": "🤖 AI 代办", "content": content}})
+    payload = json.dumps({"zh_cn": {"title": "AI 代办", "content": content}})
 
     try:
         result = subprocess.run(
@@ -155,24 +154,23 @@ def send_feishu(config: dict, message: str):
         out = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
         err = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
         if result.returncode == 0:
-            print("Message sent via feishu bot")
-            return True
+            print("Message sent via feishu bot"); return True
         print(f"[feishu send failed] {err.strip() or out.strip()}")
-        print(f"[message saved]\n{message}")
-        return False
+        print(f"[message saved]\n{message}"); return False
     except Exception as e:
-        print(f"[feishu error] {e}")
-        return False
+        print(f"[feishu error] {e}"); return False
 
 
 def send_wechat(config: dict, message: str):
     """Send message via cc-connect to WeChat."""
     data_dir = config.get("CC_DATA_DIR", r"D:\D_software\cc-connect\data")
     project = config.get("CC_PROJECT", "wechat")
+    cc_connect = r"C:\Users\wwk\AppData\Roaming\npm\cc-connect.cmd"
+    bash = r"D:\D_software\Git\usr\bin\bash.exe"
     message = message.replace("\\n", "\n").strip().replace("*", "")
     try:
-        cmd = f'cc-connect send -m "{message}" -p {project} --data-dir "{data_dir}"'
-        result = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=30)
+        cmd = f'"{cc_connect}" send -m "{message}" -p {project} --data-dir "{data_dir}"'
+        result = subprocess.run([bash, "-c", cmd], capture_output=True, timeout=30)
         out = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
         err = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
         if result.returncode == 0:
