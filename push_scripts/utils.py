@@ -2,6 +2,7 @@
 
 import os
 import json
+import re
 import subprocess
 import requests
 from pathlib import Path
@@ -11,7 +12,6 @@ def load_env(env_path: str = None) -> dict:
     """Load .env file and return config dict."""
     if env_path is None:
         env_path = Path(__file__).parent.parent / ".env"
-
     config = {}
     with open(env_path, encoding="utf-8") as f:
         for line in f:
@@ -24,9 +24,7 @@ def load_env(env_path: str = None) -> dict:
 
 
 def call_lark(cli_path: str, *args) -> dict:
-    """Call lark-cli and return parsed JSON.
-    cli_path: path to lark-cli directory (e.g. D:\\D_software\\LarkCLI)
-    """
+    """Call lark-cli and return parsed JSON."""
     node_script = os.path.join(cli_path, "node_modules", "@larksuite", "cli", "scripts", "run.js")
     cmd = ["node", node_script] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=cli_path)
@@ -43,7 +41,6 @@ def fetch_active_tasks(config: dict) -> list:
         "--base-token", config["FEISHU_BASE_TOKEN"],
         "--table-id", config["FEISHU_ACTIVE_TABLE"]
     )
-    # JSON format returns data as arrays indexed by fields
     data = r.get("data", {})
     fields = data.get("fields", [])
     rows = data.get("data", [])
@@ -55,7 +52,6 @@ def fetch_active_tasks(config: dict) -> list:
         for j, val in enumerate(row):
             if j < len(fields):
                 field_name = fields[j]
-                # Clean up: select fields return lists, extract first value
                 if isinstance(val, list):
                     if val and isinstance(val[0], str):
                         val = val[0]
@@ -72,7 +68,6 @@ def health_check(config: dict) -> list:
     """Check Feishu API and DeepSeek API, return list of failures."""
     failures = []
 
-    # Check lark-cli connectivity
     try:
         r = call_lark(
             config["LARK_CLI_PATH"],
@@ -84,7 +79,6 @@ def health_check(config: dict) -> list:
     except Exception as e:
         failures.append(f"飞书 API 异常: {e}")
 
-    # Check DeepSeek API availability
     try:
         resp = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -133,28 +127,42 @@ def deepseek_chat(config: dict, system_prompt: str, user_prompt: str) -> str:
 
 
 def send_feishu(config: dict, message: str):
-    """Send message via lark-cli bot (markdown)."""
+    """Send via lark-cli bot. Builds post content with section grouping + hr separators."""
     user_id = config.get("FEISHU_USER_ID", "ou_f5f205e1c2c2527d553b30f191892abc")
     lark_dir = config.get("LARK_CLI_PATH", r"D:\D_software\LarkCLI")
     node_script = os.path.join(lark_dir, "node_modules", "@larksuite", "cli", "scripts", "run.js")
+    message = message.replace("\\n", "\n").strip()
 
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8")
-    tmp.write(message)
-    tmp.close()
+    # Split by blank lines into sections, join section lines with \n
+    sections = re.split(r"\n\n+", message)
+    content = []
+    for i, sec in enumerate(sections):
+        lines = [l.strip() for l in sec.strip().split("\n") if l.strip()]
+        if not lines:
+            continue
+        content.append([{"tag": "md", "text": "\n".join(lines)}])
+        if i < len(sections) - 1:
+            content.append([{"tag": "hr"}])
+
+    payload = json.dumps({"zh_cn": {"title": "🤖 AI 代办", "content": content}})
 
     try:
-        cmd = f'node "{node_script}" im +messages-send --as bot --user-id {user_id} --markdown "$(cat \'{tmp.name}\')"'
-        result = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=30, cwd=lark_dir)
+        result = subprocess.run(
+            ["node", node_script, "im", "+messages-send", "--as", "bot",
+             "--user-id", user_id, "--content", payload, "--msg-type", "post"],
+            capture_output=True, timeout=30, cwd=lark_dir
+        )
         out = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
         err = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
         if result.returncode == 0:
-            print("Message sent via feishu bot"); return True
-        print(f"[feishu send failed] {err.strip() or out.strip()}"); return False
+            print("Message sent via feishu bot")
+            return True
+        print(f"[feishu send failed] {err.strip() or out.strip()}")
+        print(f"[message saved]\n{message}")
+        return False
     except Exception as e:
-        print(f"[feishu error] {e}"); return False
-    finally:
-        os.unlink(tmp.name)
+        print(f"[feishu error] {e}")
+        return False
 
 
 def send_wechat(config: dict, message: str):
